@@ -48,7 +48,7 @@ import {
   type InteractionResponse,
 } from "./gen/agent_pb";
 import { debugProviderDiagnostic } from "../../lib/debug";
-import { classifyCursorError, isCursorBenignCancelError, safeCursorErrorMessage } from "./cursor-errors";
+import { classifyCursorError, CursorStreamTruncatedError, isCursorBenignCancelError, safeCursorErrorMessage } from "./cursor-errors";
 import { mcpArgsFromToolCall } from "./protobuf-events";
 import { OCX_RESPONSES_TOOL_PROVIDER } from "./tool-definitions";
 import {
@@ -410,6 +410,12 @@ class LiveCursorTransport implements CursorTransport {
   private firstFrameTimer?: ReturnType<typeof setTimeout>;
   private committed = false;
   private expectedClose = false;
+  /**
+   * True once a terminal (`done` or `error`) has been admitted to the outbound queue. Read only
+   * by the EOF branch below: after a mapper error the bridge has already failed the turn, so
+   * failing again on EOF would add a duplicate adapter error for no benefit.
+   */
+  private emittedTerminal = false;
   private pendingFinalize?: ReturnType<typeof setTimeout>;
   private readonly clientToolFinalizeGraceMs: number;
   private activeClientToolFinalizeGraceMs: number;
@@ -531,6 +537,7 @@ class LiveCursorTransport implements CursorTransport {
     const push = (message: CursorServerMessage) => {
       const bytes = new TextEncoder().encode(JSON.stringify(message)).byteLength;
       this.reserveTransportBytes(bytes);
+      if (message.type === "done" || message.type === "error") this.emittedTerminal = true;
       queue.push({ message, bytes });
       wake();
     };
@@ -769,6 +776,7 @@ class LiveCursorTransport implements CursorTransport {
   ): void {
     this.turnStartedAt = Date.now();
     this.framesReceived = 0;
+    this.emittedTerminal = false;
     this.firstFrameAt = undefined;
     this.firstFrameLogged = false;
     const dialHost = cursorHostLabel(this.input.provider.baseUrl || "https://api2.cursor.sh");
@@ -1024,6 +1032,18 @@ class LiveCursorTransport implements CursorTransport {
         if (this.framesReceived === 0 && !this.expectedClose) {
           releaseBacklogLease();
           settler.settleFail(new Error("Cursor stream ended before any response frame (unexpected EOF)"));
+          return;
+        }
+        // A framed stream that ends without ANY terminal, while a client tool call is still open,
+        // is a truncated turn — not a success. The call was deferred (nothing was emitted for it
+        // at `toolCallStarted`), so a graceful finish drops it silently: streaming reports
+        // `response.incomplete`, but the non-streaming path defaults to `completed` and hands back
+        // a turn whose tool call simply vanished. `expectedClose` (client-tool suspend) and an
+        // already-emitted terminal are both legitimate and stay graceful.
+        if (!this.expectedClose && !state.terminated && !this.emittedTerminal && state.openToolCalls.size > 0) {
+          const openCallIds = [...state.openToolCalls.keys()];
+          releaseBacklogLease();
+          settler.settleFail(new CursorStreamTruncatedError(openCallIds, this.framesReceived));
           return;
         }
         releaseBacklogLease();
